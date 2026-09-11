@@ -1,8 +1,26 @@
 ;;; markdown-reflow.el --- Reflow Markdown section numbers, anchors, references -*- lexical-binding: t; -*-
 
-;; Version: 1.0
+;; Copyright (C) 2026 tjkopena
+
+;; Author: tjkopena <tjkopena@gmail.com>
+;; Maintainer: tjkopena <tjkopena@gmail.com>
+;; URL: https://github.com/tjkopena/markdown-reflow
+;; Version: 1.1
 ;; Package-Requires: ((emacs "25.1"))
 ;; Keywords: convenience, outlines, wp
+
+;; This program is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; Commentary:
 
@@ -46,20 +64,41 @@
 ;;   All changes made are logged to the *Messages* buffer and a summary
 ;;   reported to the echo area.
 ;;
-;;   The edit is a single undo unit only if you have not touched the
-;;   buffer in between; `C-_' may need repeating on a large document.
+;;   However many lines it touches, the reflow is one command and so
+;;   one undo unit: a single `C-_' takes the whole of it back.
 ;;
-;;   The preferred line width is defined by `fill-column' and tab stops
-;;   by `tab-width'.
+;;   The preferred line width is `markdown-reflow-width', which defaults
+;;   to `fill-column', and tab stops are `tab-width'.  The four-column
+;;   tab stops by which GFM measures the indentation defining block
+;;   structure are fixed by the specification and do not follow
+;;   `tab-width'.
 ;;
-;; The specification implemented here is markdown-reflow.md, whose
-;; regexes are PCRE2 and normative as to behavior.  Emacs regexps offer
-;; neither branch reset nor lookahead, so the patterns below decompose
-;; them; each notes what it stands for.
+;; The specification implemented here is markdown-reflow.md, version
+;; 1.1, whose regexes are PCRE2 and normative as to behavior.  Emacs
+;; regexps offer neither branch reset nor lookahead, so the patterns
+;; below decompose them; each notes what it stands for.
 
 ;;; Code:
 
 (require 'subr-x)
+
+
+;;; Customization
+
+(defgroup markdown-reflow nil
+  "Reflow Markdown section numbering, anchors, and references."
+  :group 'text
+  :prefix "markdown-reflow-")
+
+(defcustom markdown-reflow-width nil
+  "Preferred line width anchors are right-justified to.
+Nil, the default, follows `fill-column', so that reflow honors
+whatever width the buffer is already being filled to.  Set this
+where anchors are to be justified to a width of their own, as when
+a document is filled to 70 columns but ruled at 72."
+  :type '(choice (const :tag "Follow `fill-column'" nil)
+                 (integer :tag "Columns"))
+  :group 'markdown-reflow)
 
 
 ;;; Patterns
@@ -72,11 +111,11 @@
   "Numbered section heading.
 Stands for the specified
 
-  ^(##+)[ \\t]+(?|([0-9]+(?:\\.[0-9]+)+)\\.?|([0-9]+)\\.)(?=[ \\t]|$)
+  ^(#{2,6})[ \\t]+(?|([0-9]+(?:\\.[0-9]+)+)\\.?|([0-9]+)\\.)(?=[ \\t]|$)
 
-with the hash run capped at six, the branch reset spelled out as
-groups 2 and 3, and the lookahead as group 4, whose beginning is
-where the title's leading whitespace starts.")
+with the branch reset spelled out as groups 2 and 3, and the
+lookahead as group 4, whose beginning is where the title's leading
+whitespace starts.")
 
 (defconst markdown-reflow--anchor-re
   (concat "^\\(#\\{2,6\\}\\)\\(?:.*[^ \t]\\)?"
@@ -84,18 +123,38 @@ where the title's leading whitespace starts.")
   "Anchor on a section heading line.
 Stands for the specified
 
-  ^(##+)(?=[ \\t])(?:.*[^ \\t])?([ \\t]+)\\^([A-Za-z0-9_/#-]+)([ \\t]*)$
+  ^(#{2,6})(?=[ \\t])(?:.*[^ \\t])?([ \\t]+)\\^([A-Za-z0-9_/#-]+)([ \\t]*)$
 
 The lookahead asserting whitespace after the hash run cannot be
 written here and is checked by `markdown-reflow--anchor-match-p'.")
 
 (defconst markdown-reflow--reference-re
   (concat "§\\([A-Za-z0-9_/#-]+\\)"
-          "\\(?::\\(?:NOREF\\|DUPE\\|NONUM\\|[0-9]+\\(?:\\.[0-9]+\\)*\\)\\)?")
+          "\\(?::[A-Za-z0-9_/#-]+\\(?:\\.[A-Za-z0-9_/#-]+\\)*\\)*")
   "Reference to a section by its anchor.
 Stands for the specified
 
-  §([A-Za-z0-9_/#-]+)(:(?:NOREF|DUPE|NONUM|[0-9]+(?:\\.[0-9]+)*))?")
+  §([A-Za-z0-9_/#-]+)((?::[A-Za-z0-9_/#-]+(?:\\.[A-Za-z0-9_/#-]+)*)*)
+    (?!\\.[A-Za-z0-9_/#-])
+
+with the run of appellations matched shy where the specification
+captures it as group 2, the rewrite working from the whole match,
+and the closing lookahead checked by
+`markdown-reflow--dot-opens-appellation-p'.
+
+However many appellations a reference carries, all are consumed
+and one is emitted, so a stale number, an exception flag, and the
+NONUM of earlier versions alike are taken by the class rather than
+by an alternative naming each.  A colon opening no appellation ends
+the match: one followed by whitespace or the end of the line, one
+followed by a character that opens none, and one escaped with a
+backslash, the backslash being no colon and so no separator.")
+
+(defconst markdown-reflow--identifier-char-re
+  "\\`[A-Za-z0-9_/#-]\\'"
+  "One character of an anchor identifier or an appellation.
+The specified [A-Za-z0-9_/#-], anchored so that it matches a
+single character rather than searching for one.")
 
 (defconst markdown-reflow--fence-open-re
   "^ \\{0,3\\}\\(?:\\(`\\{3,\\}\\)[^`]*\\|\\(~\\{3,\\}\\).*\\)$"
@@ -252,9 +311,8 @@ An unpaired fence is logged and masks the remainder of the document."
            (indented
             (aset code i t)
             (setq kind 'code))
-           ((markdown-reflow--fence-open line)
-            (setq fence (markdown-reflow--fence-open line)
-                  fence-line i)
+           ((setq fence (markdown-reflow--fence-open line))
+            (setq fence-line i)
             (aset code i t)
             (setq kind 'code))
            (blank
@@ -427,6 +485,18 @@ the section number of the heading carrying it, nil if unnumbered."
                 (markdown-reflow--problem
                  (1+ i) "additional single-hash heading ignored: %s" line)
               (setq titled t)))
+          ;; The mask is consulted for the number and the caret alike
+          ;; though neither can in fact fall within a code span today:
+          ;; whole lines of code blocks are already skipped above, and
+          ;; a heading line is a masking region of its own, so a span
+          ;; masking the number would need a backtick ahead of it,
+          ;; where the heading pattern admits only whitespace, and one
+          ;; masking the caret would have to close after the anchor,
+          ;; where the anchor pattern admits only whitespace and the
+          ;; end of the line.  The checks stand against a widening of
+          ;; either pattern, section 3 of the specification holding
+          ;; without qualification that anchors within inline code are
+          ;; ignored.
           (when (and (string-match markdown-reflow--numbered-heading-re line)
                      (not (markdown-reflow--masked-p
                            marks i (or (match-beginning 2)
@@ -451,22 +521,25 @@ the section number of the heading carrying it, nil if unnumbered."
 
 (defun markdown-reflow--resolve (id anchors line)
   "Return the appellation for a reference to ID in ANCHORS.
-Any error is logged against LINE."
+The value is nil where the section bears no number, there being
+nothing to expand the reference with; the caller then emits the
+bare reference.  Only an anchor that does not exist is logged,
+against LINE, there being no heading to log it against.  A
+duplicated anchor is a property of the heading lines and was
+logged against each redefinition by `markdown-reflow--analyze',
+whatever the references it spoils."
   (let ((entry (gethash id anchors)))
     (cond
      ((null entry)
       (markdown-reflow--problem (1+ line) "reference to undefined anchor: §%s" id)
       "NOREF")
+     ;; A duplicated anchor is flagged whether or not it is numbered.
      ((> (car entry) 1)
-      ;; DUPE takes precedence over NONUM, but both are logged.
-      (markdown-reflow--problem (1+ line) "reference to duplicated anchor: §%s" id)
-      (unless (cdr entry)
-        (markdown-reflow--problem
-         (1+ line) "reference to unnumbered section: §%s" id))
       "DUPE")
+     ;; An anchor on an unnumbered section is no error.  The reference
+     ;; is left bare, shedding any appellation it arrived with.
      ((null (cdr entry))
-      (markdown-reflow--problem (1+ line) "reference to unnumbered section: §%s" id)
-      "NONUM")
+      nil)
      ;; A reference carries no trailing dot, being agnostic to the one
      ;; a single-component heading number bears.
      (t (string-remove-suffix "." (cdr entry))))))
@@ -474,11 +547,30 @@ Any error is logged against LINE."
 
 ;;; Rewriting
 
+(defun markdown-reflow--dot-opens-appellation-p (line end)
+  "Return non-nil if a dot at END in LINE would open an appellation.
+Supplies the negative lookahead closing the reference pattern.  A
+match trailed by a dot and an identifier character is no reference:
+an appellation emitted ahead of that dot would join the text after
+it into one dot-separated run, which the next reflow would consume
+whole, and rule 0 forbids a transformation that does not stand.
+
+The lookahead can bite only where the run of appellations is
+empty, a non-empty run having already taken any dot that could
+follow it."
+  (and (< (1+ end) (length line))
+       (eq (aref line end) ?.)
+       (string-match-p markdown-reflow--identifier-char-re
+                       (string (aref line (1+ end))))))
+
 (defun markdown-reflow--update-references (line index marks anchors counts)
   "Return LINE with its unmasked references updated.
 INDEX is the line's position, MARKS the mask, ANCHORS the table
 of anchor identifiers, and COUNTS the tally each updated
-reference is counted into."
+reference is counted into.  A reference to an unnumbered section
+has no appellation to take and is emitted bare.  A masked match
+and one the closing lookahead rejects are alike left whole, and
+neither is resolved, so neither draws a log."
   (let ((result "")
         (pos 0))
     (while (string-match markdown-reflow--reference-re line pos)
@@ -486,10 +578,14 @@ reference is counted into."
              (end (match-end 0))
              (id (match-string 1 line))
              (old (substring line begin end))
-             (new (if (markdown-reflow--masked-p marks index begin)
+             (new (if (or (markdown-reflow--masked-p marks index begin)
+                          (markdown-reflow--dot-opens-appellation-p line end))
                       old
-                    (concat "§" id ":"
-                            (markdown-reflow--resolve id anchors index)))))
+                    (let ((appellation
+                           (markdown-reflow--resolve id anchors index)))
+                      (if appellation
+                          (concat "§" id ":" appellation)
+                        (concat "§" id))))))
         (unless (string= new old)
           (aset counts 1 (1+ (aref counts 1))))
         (setq result (concat result (substring line pos begin) new)
@@ -594,19 +690,17 @@ markers about them are left where they are."
 
 (defun markdown-reflow--report (counts)
   "Log the work COUNTS tallies and report a summary to the echo area."
-  (let ((entries (nreverse markdown-reflow--problems))
-        (changes (nreverse markdown-reflow--changes)))
+  (let* ((entries (nreverse markdown-reflow--problems))
+         (changes (nreverse markdown-reflow--changes))
+         (headings (aref counts 0))
+         (references (aref counts 1))
+         (anchors (aref counts 2))
+         (problems (length entries)))
     (let ((inhibit-message t))
       (dolist (entry entries)
         (message "markdown-reflow: %s" entry))
       (dolist (entry changes)
         (message "markdown-reflow: %s" entry)))
-    (setq markdown-reflow--problems entries
-          markdown-reflow--changes changes))
-  (let ((headings (aref counts 0))
-        (references (aref counts 1))
-        (anchors (aref counts 2))
-        (problems (length markdown-reflow--problems)))
     (if (and (zerop headings) (zerop references) (zerop anchors)
              (zerop problems))
         (message "markdown-reflow: no changes")
@@ -620,6 +714,13 @@ markers about them are left where they are."
          (format ", %d problem%s logged"
                  problems (if (= problems 1) "" "s")))))))
 
+(defun markdown-reflow--width ()
+  "Return the preferred line width anchors are justified to.
+`markdown-reflow-width' where it is set, otherwise `fill-column',
+which may itself be nil where filling is disabled; the Emacs
+default of 70 stands in for that."
+  (or markdown-reflow-width fill-column 70))
+
 ;;;###autoload
 (defun markdown-reflow ()
   "Reflow Markdown section numbering, anchors, and references.
@@ -627,8 +728,9 @@ markers about them are left where they are."
 Section numbers are renumbered so that the numbering at each
 depth starts at 1, has no gaps, and is in order; references are
 given the number of the section whose anchor they name; and
-anchors are right-justified to `fill-column'.  Code blocks and
-inline code are left alone.
+anchors are right-justified to `markdown-reflow-width', which
+defaults to `fill-column'.  Code blocks and inline code are left
+alone.
 
 The whole buffer is reflowed, whatever the region or narrowing,
 and point is left where it was.  Changes are logged to the
@@ -648,7 +750,7 @@ and point is left where it was.  Changes are logged to the
                (rewritten (markdown-reflow--rewrite
                            lines marks
                            (nth 0 analysis) (nth 1 analysis) (nth 2 analysis)
-                           fill-column counts)))
+                           (markdown-reflow--width) counts)))
           (markdown-reflow--apply lines rewritten))))
     (markdown-reflow--report counts)))
 
