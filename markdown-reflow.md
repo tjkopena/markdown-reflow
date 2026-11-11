@@ -1,7 +1,7 @@
 # Markdown Reflow Specification
 
 Markdown sections and reflow are defined in this document.  This is
-Markdown reflow specification version 1.0.
+Markdown reflow specification version 1.2.
 
 
 ## 1. Introduction
@@ -29,7 +29,8 @@ editor modules that:
 
 * Reflow dot-notation section heading enumeration.
 * Right-justify careted anchors on section headings.
-* Update section mark references to those anchors.
+* Update section mark references to those anchors, whether in the same
+  document or in another.
 
 ### 1.1 Example
 
@@ -149,7 +150,9 @@ Group 4 is extraneous whitespace to delete.
 Where a heading line bears more than one caret, the last is the anchor.
 
 Anchors may be put on both numbered and unnumbered section headings.
-Both contribute to detection of duplicated anchor identifiers.  An
+Both contribute to detection of duplicated anchor identifiers.  Anchors
+are scoped to their document: The same identifier anchored once in each
+of two documents is no duplicate.  An
 anchor on an unnumbered section heading is accepted without complaint
 and nothing is logged for it; references to it simply carry no number.
 
@@ -165,22 +168,31 @@ separated by dots (`.`), such as `2`, `1.2.3`, `NOREF`, or `draft`.
 Dots separate runs and so never open or close one.
 
 **Reference.** A citation or pointer to a section via its anchor,
-denoted by a section mark (`§`) followed by the anchor identifier and
-any number of appellations, each preceded by a colon (`:`). Regex:
+denoted by a section mark (`§`) followed by an optional path and colon
+(`:`), the anchor identifier, and any number of appellations, each
+preceded by a colon.  Regex:
 
 ```
-§([A-Za-z0-9_/#-]+)((?::[A-Za-z0-9_/#-]+(?:\.[A-Za-z0-9_/#-]+)*)*)
+§(?:((?!/)[A-Za-z0-9_/#.-]*\.[A-Za-z0-9_/#.-]*+(?<!\.)):)?
+  ([A-Za-z0-9_/#-]++)((?::[A-Za-z0-9_/#-]+(?:\.[A-Za-z0-9_/#-]+)*)*)
   (?!\.[A-Za-z0-9_/#-])
 ```
 
-This one pattern is written across two lines as with the `x` modifier,
-whitespace outside a character class being insignificant.
+This one pattern is written across three lines as with the `x`
+modifier, whitespace outside a character class being insignificant.
 
-Group 1 is the anchor identifier to reference.  Group 2 is the whole run
-of appellations, however many, to be replaced with a single correctly
+Group 1 is the path of the document defining the anchor, unmatched
+where the anchor is in the referencing document itself.  Group 2 is the
+anchor identifier to reference.  Group 3 is the whole run of
+appellations, however many, to be replaced with a single correctly
 reflowed section number or exception flag (preceded by a colon) for the
 referenced section, or to be removed entirely where that section bears
 no number.
+
+The anchor identifier is matched possessively and so is always the
+whole of its run of identifier characters.  The closing lookahead below
+cannot be satisfied by giving characters of the identifier back, as
+matching `§lega` within `§legal.b` would.
 
 A colon opens an appellation only where one follows it.  A colon
 immediately followed by whitespace or the end of the line, one
@@ -222,6 +234,38 @@ while `§pagans.Next`, wanting the space its author meant to type, is
 left alone entire.
 
 Forward references are permitted and supported.
+
+**Path.**  The location of another document, the _target_, whose anchor
+a reference names: Group 1 of the reference pattern, written between the
+section mark and the anchor identifier and separated from the latter by
+a colon.  For example, `§test.md:introduction:1` refers to section 1,
+anchored `introduction`, in `test.md`.  A reference without a path
+refers to an anchor in the document in which it appears.
+
+A path is a run of anchor identifier characters and dots holding at
+least one dot, neither opening with a slash nor closing with a dot, and
+followed by a colon and an anchor identifier.  The dot is what tells a
+path from an anchor identifier, which holds none: `§test.md:intro` names
+`^intro` in `test.md`, where `§test:intro` names `^test` in the same
+document with the stale appellation `intro`.  A target whose name bears
+no extension is reached with a leading `./`, as in `§./README:intro`.  A
+target whose path holds any other character, such as a space or a colon,
+cannot be referenced.
+
+A path is always relative, resolved against the directory containing
+the referencing document, and its separator is the slash whatever the
+platform.  A path opening with a slash would be absolute and so is no
+path at all: `§/x.md:intro` is no reference and is left alone, as is
+`§test.md: Text`, its colon opening no anchor identifier.  Where the
+referencing document has no location, as an unsaved editor buffer, no
+path can be resolved.
+
+Paths alter no reference written without one.  The closing lookahead
+already makes ordinary text of an identifier followed by a dot and an
+identifier character, so every path form was ordinary text before paths
+were recognized.  A path may not close with a dot so that in
+`§intro.:b` the reference remains `§intro`, its dot punctuation, as it
+was before.
 
 **Fences.**  Delimiter lines opening or closing a fenced code block: a
 run of three or more backticks (```` ``` ````) or three or more tildes
@@ -555,6 +599,39 @@ The following rules specify the maintenance enacted by Markdown reflow.
      * Example: `§legal.b` is left as it stands, where `§legal.` and
        `§legal. b` each take their number.
 
+   * **3.6** A reference bearing a path is resolved against the anchors
+     of its target, and rules 3 through 3.5 apply as they do within the
+     referencing document.  The target is read and its section numbers
+     and anchors determined as reflow would assign them, code blocks and
+     inline code masked alike.  The numbers written in the target are
+     not consulted, so a reference takes the number its section will
+     bear once the target is reflowed, whether or not it has been.  The
+     path is emitted exactly as written.
+
+     * Example: For a `test.md` beside the referencing document whose
+       `^introduction` section reflows to 1, `§test.md:introduction` and
+       `§test.md:introduction:9` both become `§test.md:introduction:1`,
+       and `§test.md:bogus` becomes `§test.md:bogus:NOREF`.
+
+   * **3.7** The target is never altered, and defects within it, such
+     as a duplicated anchor or a second single-hash heading, are not
+     logged; they are the target's own, logged when it is reflowed.
+     Each target is read once per reflow, so that every reference to it
+     resolves against the same text, and a path resolving to the
+     referencing document names that document as this reflow numbers
+     it, not as last saved.  Rule 0 holds against unchanged targets:
+     Editing a target may change the numbers its references take on the
+     next reflow, as editing the referencing document may.
+
+   * **3.8** If the target cannot be read, as where it does not exist or
+     is not a regular file, the reference is left alone entire, its
+     appellations included, and the error logged.  A target missing
+     from one copy of a document set thereby leaves its references'
+     last resolution standing rather than overwriting it.
+
+     * Example: Where `missing.md` cannot be read, `§missing.md:intro:4`
+       is left as it stands.
+
 4. Precedence among operations from greatest to least is: Section
    re-numbering, then references, then anchor justification.  This
    matters, e.g., in section headings combining multiple features and
@@ -802,3 +879,72 @@ Of note:
   beneath it are in separate regions, a heading line constituting a
   region of its own, so neither masks the reference between them.  The
   heading is renumbered with its title, backtick and all, left alone.
+
+
+## 8. Cross-Document Fixture
+
+The following is normative as a conformance fixture for paths and rules
+3.6 through 3.8.  A document `guide.md` sits beside a directory `ref`
+holding the target `ref/test.md`, and no `missing.md` exists.  Widths
+are shown at left under a preferred line width of 72.  The target, read
+but never altered:
+
+```
+ 6  # Test
+32  ## 3. Introduction ^introduction
+20  ### 3.4 Scope ^scope
+18  ## Glossary ^terms
+18  ## 9. Twice ^twice
+18  ## 9. Again ^twice
+ 3  ~~~
+20  ## 9. Masked ^hidden
+ 3  ~~~
+```
+
+Input of `guide.md`:
+
+```
+ 7  # Guide
+24  ## 5. Overview ^overview
+57  See §ref/test.md:introduction and §ref/test.md:scope:9.9.
+49  Also §ref/test.md:terms:1 and §ref/test.md:twice.
+34  Masked there: §ref/test.md:hidden.
+52  Here: §guide.md:overview and §./guide.md:overview:7.
+48  Gone: §missing.md:intro:4 and §missing.md:intro.
+63  No paths: §ref/test.md:scope.b, §/abs.md:scope, §test.md: Text.
+```
+
+Output:
+
+```
+ 7  # Guide
+72  ## 1. Overview                                                 ^overview
+59  See §ref/test.md:introduction:1 and §ref/test.md:scope:1.1.
+52  Also §ref/test.md:terms and §ref/test.md:twice:DUPE.
+40  Masked there: §ref/test.md:hidden:NOREF.
+54  Here: §guide.md:overview:1 and §./guide.md:overview:1.
+48  Gone: §missing.md:intro:4 and §missing.md:intro.
+63  No paths: §ref/test.md:scope.b, §/abs.md:scope, §test.md: Text.
+```
+
+Of note:
+
+* The target's stale numbers are not consulted.  `^introduction` and
+  `^scope` take `1` and `1.1`, the numbers reflow would assign them,
+  per rule 3.6, and the trailing dot closing the `See` line is left
+  alone as within a single document.
+* `^terms` is on an unnumbered heading of the target, so its reference
+  is left bare, per rule 3.3.  `^twice` is defined twice in the target
+  and resolves to `DUPE`, per rule 3.2, but that duplication is the
+  target's and is not logged, per rule 3.7.
+* `^hidden` lies within a fenced code block of the target and so is no
+  anchor there.  Its reference resolves to `NOREF` and is logged.
+* Both paths of the `Here` line resolve to `guide.md` itself, which
+  each reference names as this reflow numbers it, per rule 3.7.
+* `missing.md` cannot be read, so both its references are left as they
+  stand, each with an error logged, per rule 3.8.
+* No reference of the `No paths` line is touched.  `§ref/test.md:scope`
+  is trailed by a dot and an identifier character, per rule 3.5; a path
+  may not open with a slash; and `§test.md: Text` holds no anchor
+  identifier after its path.  None is a reference with or without a
+  path, and none is logged.

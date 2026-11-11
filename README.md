@@ -58,6 +58,13 @@ reported to the echo area.
 However many lines it touches, the reflow is one command and so one
 undo unit: a single `C-_` takes the whole of it back.
 
+References to anchors in other documents, such as
+`§notes.md:intro:1`, are resolved relative to the directory of the
+file the buffer visits.  Each such document is read from disk, never
+altered, and its sections numbered as reflow would number them.  A
+reference to a document that cannot be read, or from a buffer visiting
+no file, is left alone and logged.
+
 The preferred line width is `markdown-reflow-width` and tab stops are
 `tab-width`.  The four-column tab stops by which GFM measures block
 structure indentation are fixed and do not follow `tab-width`.
@@ -80,7 +87,7 @@ executed in batch mode:
 emacs -Q --batch -l markdown-reflow-test.el
 ```
 
-The suite covers both normative conformance fixtures of the
+The suite covers all three normative conformance fixtures of the
 specification, every transformation rule, code block and inline code
 masking, and the reflow of this file and the specification themselves,
 which carry the notation they define and so must already be reflowed.

@@ -3,8 +3,9 @@
 ;;; Commentary:
 
 ;; Test cases for markdown-reflow.el, covering the transformation
-;; rules, code block and inline code masking, and both normative
-;; conformance fixtures of markdown-reflow.md.
+;; rules, code block and inline code masking, references to other
+;; documents, and the three normative conformance fixtures of
+;; markdown-reflow.md.
 ;;
 ;; Run in batch mode:
 ;;
@@ -610,6 +611,208 @@ draws no log."
                  (mrt--lines (concat "## 1. A" (make-string 31 ?\s) "^a")
                              (concat "## 2. B, see §a:1" (make-string 21 ?\s)
                                      "^b")))))
+
+
+;;; Rules 3.6 through 3.8: references to other documents
+
+(defmacro mrt--with-documents (files &rest body)
+  "Evaluate BODY in a fresh directory, bound to `dir', holding FILES.
+FILES is a list of (NAME . TEXT), NAME relative to the directory,
+which is deleted afterward."
+  (declare (indent 1) (debug t))
+  `(let ((dir (file-name-as-directory (make-temp-file "mrt" t))))
+     (unwind-protect
+         (progn
+           (dolist (file ,files)
+             (let ((path (expand-file-name (car file) dir))
+                   (coding-system-for-write 'utf-8))
+               (make-directory (file-name-directory path) t)
+               (with-temp-file path (insert (cdr file)))))
+           ,@body)
+       (delete-directory dir t))))
+
+(defun mrt--reflow-file (file input &optional width)
+  "Return (OUTPUT . LOG) of INPUT reflowed in a buffer named for FILE.
+The buffer is never saved, so FILE as stored holds whatever it did."
+  (let* ((output nil)
+         (log (mrt--with-log
+                (with-temp-buffer
+                  (insert input)
+                  (setq buffer-file-name file
+                        fill-column (or width 72)
+                        tab-width 8)
+                  (let ((markdown-reflow-width nil)
+                        (create-lockfiles nil))
+                    (markdown-reflow))
+                  (setq output (buffer-string))
+                  (set-buffer-modified-p nil)
+                  (setq buffer-file-name nil)))))
+    (cons output log)))
+
+(defun mrt--file-text (file)
+  "Return the text stored in FILE."
+  (with-temp-buffer
+    (let ((coding-system-for-read 'utf-8))
+      (insert-file-contents file))
+    (buffer-string)))
+
+(defconst mrt--cross-target
+  (mrt--lines "# Test"
+              "## 3. Introduction ^introduction"
+              "### 3.4 Scope ^scope"
+              "## Glossary ^terms"
+              "## 9. Twice ^twice"
+              "## 9. Again ^twice"
+              "~~~"
+              "## 9. Masked ^hidden"
+              "~~~")
+  "The target of the cross-document fixture, section 8 of markdown-reflow.md.")
+
+(defconst mrt--cross-input
+  (mrt--lines "# Guide"
+              "## 5. Overview ^overview"
+              "See §ref/test.md:introduction and §ref/test.md:scope:9.9."
+              "Also §ref/test.md:terms:1 and §ref/test.md:twice."
+              "Masked there: §ref/test.md:hidden."
+              "Here: §guide.md:overview and §./guide.md:overview:7."
+              "Gone: §missing.md:intro:4 and §missing.md:intro."
+              "No paths: §ref/test.md:scope.b, §/abs.md:scope, §test.md: Text.")
+  "Input of the cross-document fixture, section 8 of markdown-reflow.md.")
+
+(defconst mrt--cross-output
+  (mrt--lines "# Guide"
+              "## 1. Overview                                                 ^overview"
+              "See §ref/test.md:introduction:1 and §ref/test.md:scope:1.1."
+              "Also §ref/test.md:terms and §ref/test.md:twice:DUPE."
+              "Masked there: §ref/test.md:hidden:NOREF."
+              "Here: §guide.md:overview:1 and §./guide.md:overview:1."
+              "Gone: §missing.md:intro:4 and §missing.md:intro."
+              "No paths: §ref/test.md:scope.b, §/abs.md:scope, §test.md: Text.")
+  "Output of the cross-document fixture, section 8 of markdown-reflow.md.")
+
+(ert-deftest mrt-cross-document-fixture ()
+  "The conformance fixture of section 8 of markdown-reflow.md."
+  (mrt--with-documents `(("ref/test.md" . ,mrt--cross-target))
+    (let ((guide (expand-file-name "guide.md" dir)))
+      (should (equal (car (mrt--reflow-file guide mrt--cross-input))
+                     mrt--cross-output))
+      (should (equal (car (mrt--reflow-file guide mrt--cross-output))
+                     mrt--cross-output)))))
+
+(ert-deftest mrt-cross-document-fixture-log ()
+  "Section 8: what the fixture logs, and what it does not.
+The undefined anchor and both unreadable references are logged; the
+target's duplicate, its stale numbers, and the rejected paths are not."
+  (mrt--with-documents `(("ref/test.md" . ,mrt--cross-target))
+    (let ((log (cdr (mrt--reflow-file (expand-file-name "guide.md" dir)
+                                      mrt--cross-input))))
+      (should (string-match-p
+               "line 5: reference to undefined anchor: §ref/test.md:hidden" log))
+      (should (string-match-p
+               "line 7: reference to unreadable document: §missing.md:intro" log))
+      (should (= 2 (cl-count-if (lambda (l) (string-match-p "unreadable" l))
+                                (split-string log "\n"))))
+      (should-not (string-match-p "multiple times" log))
+      (should-not (string-match-p "line 8: reference" log))
+      (should (string-match-p "3 problems logged" log)))))
+
+(ert-deftest mrt-cross-document-target-unaltered ()
+  "Rule 3.7: the target is read and never written."
+  (mrt--with-documents `(("ref/test.md" . ,mrt--cross-target))
+    (mrt--reflow-file (expand-file-name "guide.md" dir) mrt--cross-input)
+    (should (equal (mrt--file-text (expand-file-name "ref/test.md" dir))
+                   mrt--cross-target))))
+
+(ert-deftest mrt-cross-document-path-needs-a-dot ()
+  "Section 3, Path: the dot tells a path from an anchor identifier.
+Without one the first component is the anchor, and the rest stale
+appellations; with a leading `./' a name with no extension is a path."
+  (mrt--with-documents '(("README" . "## 4. R ^intro") ("t.md" . "## 9. T ^intro"))
+    (let ((doc (expand-file-name "doc.md" dir)))
+      (should (equal (car (mrt--reflow-file
+                           doc (mrt--lines "## 7. D ^test"
+                                           "§test:intro §./README:intro §t.md:intro:5")
+                           40))
+                     (mrt--lines (concat "## 1. D" (make-string 28 ?\s) "^test")
+                                 "§test:1 §./README:intro:1 §t.md:intro:1"))))))
+
+(ert-deftest mrt-cross-document-path-is-relative ()
+  "Section 3, Path: a path is resolved against the referencing
+document's directory, and may climb out of it."
+  (mrt--with-documents '(("top.md" . "## 1. A\n## 2. B ^b")
+                         ("sub/top.md" . "## 1. Wrong ^b"))
+    (should (equal (car (mrt--reflow-file (expand-file-name "sub/doc.md" dir)
+                                          "§../top.md:b and §top.md:b"))
+                   "§../top.md:b:2 and §top.md:b:1"))))
+
+(ert-deftest mrt-cross-document-rejected-paths ()
+  "Section 3, Path: a path opening with a slash, closing with a dot, or
+followed by no identifier is no path, and the text is read as though
+paths were never recognized.  None draws a log."
+  (mrt--with-documents '(("t.md" . "## 1. T ^intro"))
+    (let* ((input (mrt--lines "## 9. I ^intro"
+                              "§/t.md:intro §t.md: x §t.md:intro.b §intro.:b"))
+           (result (mrt--reflow-file (expand-file-name "doc.md" dir) input 40)))
+      (should (equal (car result)
+                     (mrt--lines (concat "## 1. I" (make-string 27 ?\s) "^intro")
+                                 "§/t.md:intro §t.md: x §t.md:intro.b §intro:1.:b")))
+      (should-not (string-match-p "reference to" (cdr result))))))
+
+(ert-deftest mrt-cross-document-unreadable-left-alone ()
+  "Rule 3.8: a reference to a document that cannot be read keeps its
+appellations, a directory being no more readable than a missing file."
+  (mrt--with-documents '(("sub/x.md" . "## 1. X ^x"))
+    (let ((result (mrt--reflow-file (expand-file-name "doc.md" dir)
+                                    "§none.md:x:9 §./sub:x:3 §sub/x.md:x:3")))
+      (should (equal (car result) "§none.md:x:9 §./sub:x:3 §sub/x.md:x:1"))
+      (should (string-match-p "unreadable document: §none.md:x" (cdr result)))
+      (should (string-match-p "unreadable document: §./sub:x" (cdr result)))
+      (should-not (string-match-p "unreadable document: §sub/x.md" (cdr result))))))
+
+(ert-deftest mrt-cross-document-without-a-file ()
+  "Section 3, Path: a buffer visiting no file resolves no path, and
+leaves each such reference alone with the error logged."
+  (should (equal (mrt--reflow "See §t.md:a:9.") "See §t.md:a:9."))
+  (should (string-match-p "from one with no file: §t.md:a"
+                          (mrt--log-of "See §t.md:a:9."))))
+
+(ert-deftest mrt-cross-document-self-as-reflowed ()
+  "Rule 3.7: a path naming the document being reflowed resolves against
+it as this reflow numbers it, not as last saved."
+  (mrt--with-documents '(("doc.md" . "## 1. Saved ^a"))
+    (should (equal (car (mrt--reflow-file
+                         (expand-file-name "doc.md" dir)
+                         (mrt--lines "## 1. New" "## 1. Moved ^a" "§doc.md:a")
+                         40))
+                   (mrt--lines "## 1. New"
+                               (concat "## 2. Moved" (make-string 27 ?\s) "^a")
+                               "§doc.md:a:2")))))
+
+(ert-deftest mrt-cross-document-target-read-once ()
+  "Rule 3.7: each target is read once per reflow, however many
+references name it and however its path is spelled."
+  (mrt--with-documents '(("t.md" . "## 1. T ^a\n## 2. U ^b"))
+    (let* ((reads 0)
+           (insert (symbol-function 'insert-file-contents)))
+      (cl-letf (((symbol-function 'insert-file-contents)
+                 (lambda (&rest args)
+                   (setq reads (1+ reads))
+                   (apply insert args))))
+        (should (equal (car (mrt--reflow-file (expand-file-name "doc.md" dir)
+                                              "§t.md:a §t.md:b §./t.md:a"))
+                       "§t.md:a:1 §t.md:b:2 §./t.md:a:1")))
+      (should (= reads 1)))))
+
+(ert-deftest mrt-cross-document-anchors-scoped ()
+  "Section 3, Anchor: one identifier anchored in each of two documents
+is no duplicate; each reference takes its own document's number."
+  (mrt--with-documents '(("t.md" . "## 1. T\n## 2. U ^a"))
+    (let ((result (mrt--reflow-file (expand-file-name "doc.md" dir)
+                                    (mrt--lines "## 1. D ^a" "§a §t.md:a") 40)))
+      (should (equal (car result)
+                     (mrt--lines (concat "## 1. D" (make-string 31 ?\s) "^a")
+                                 "§a:1 §t.md:a:2")))
+      (should-not (string-match-p "DUPE\\|multiple times" (cdr result))))))
 
 
 ;;; Code blocks

@@ -5,7 +5,7 @@
 ;; Author: tjkopena <tjkopena@gmail.com>
 ;; Maintainer: tjkopena <tjkopena@gmail.com>
 ;; URL: https://github.com/tjkopena/markdown-reflow
-;; Version: 1.1
+;; Version: 1.2
 ;; Package-Requires: ((emacs "25.1"))
 ;; Keywords: convenience, outlines, wp
 
@@ -39,7 +39,9 @@
 ;; `markdown-reflow' maintains that notation over a whole buffer:
 ;; dot-notation section numbers are renumbered in order without gaps,
 ;; references are updated with the number of the section they name, and
-;; careted anchors are right-justified.
+;; careted anchors are right-justified.  A reference may name an anchor
+;; in another document by a path relative to this one, as in
+;; §notes.md:intro:1.
 ;;
 ;; Usage:
 ;;
@@ -73,8 +75,12 @@
 ;;   structure are fixed by the specification and do not follow
 ;;   `tab-width'.
 ;;
+;;   Paths of references to other documents are resolved against the
+;;   directory of the file the buffer visits.  A buffer visiting no
+;;   file cannot resolve them, and leaves such references alone.
+;;
 ;; The specification implemented here is markdown-reflow.md, version
-;; 1.1, whose regexes are PCRE2 and normative as to behavior.  Emacs
+;; 1.2, whose regexes are PCRE2 and normative as to behavior.  Emacs
 ;; regexps offer neither branch reset nor lookahead, so the patterns
 ;; below decompose them; each notes what it stands for.
 
@@ -128,20 +134,9 @@ Stands for the specified
 The lookahead asserting whitespace after the hash run cannot be
 written here and is checked by `markdown-reflow--anchor-match-p'.")
 
-(defconst markdown-reflow--reference-re
-  (concat "§\\([A-Za-z0-9_/#-]+\\)"
-          "\\(?::[A-Za-z0-9_/#-]+\\(?:\\.[A-Za-z0-9_/#-]+\\)*\\)*")
-  "Reference to a section by its anchor.
-Stands for the specified
-
-  §([A-Za-z0-9_/#-]+)((?::[A-Za-z0-9_/#-]+(?:\\.[A-Za-z0-9_/#-]+)*)*)
-    (?!\\.[A-Za-z0-9_/#-])
-
-with the run of appellations matched shy where the specification
-captures it as group 2, the rewrite working from the whole match,
-and the closing lookahead checked by
-`markdown-reflow--dot-opens-appellation-p'.
-
+(defconst markdown-reflow--appellations-re
+  "\\(?::[A-Za-z0-9_/#-]+\\(?:\\.[A-Za-z0-9_/#-]+\\)*\\)*"
+  "The run of appellations closing a reference, matched shy.
 However many appellations a reference carries, all are consumed
 and one is emitted, so a stale number, an exception flag, and the
 NONUM of earlier versions alike are taken by the class rather than
@@ -149,6 +144,38 @@ by an alternative naming each.  A colon opening no appellation ends
 the match: one followed by whitespace or the end of the line, one
 followed by a character that opens none, and one escaped with a
 backslash, the backslash being no colon and so no separator.")
+
+(defconst markdown-reflow--reference-re
+  (concat "§\\([A-Za-z0-9_/#-]+\\)" markdown-reflow--appellations-re)
+  "Reference to a section by its anchor, bearing no path.
+Together with `markdown-reflow--path-reference-re' stands for the
+specified
+
+  §(?:((?!/)[A-Za-z0-9_/#.-]*\\.[A-Za-z0-9_/#.-]*+(?<!\\.)):)?
+    ([A-Za-z0-9_/#-]++)((?::[A-Za-z0-9_/#-]+(?:\\.[A-Za-z0-9_/#-]+)*)*)
+    (?!\\.[A-Za-z0-9_/#-])
+
+with the path alternative split out, the identifier here group 1,
+and the run of appellations matched shy where the specification
+captures it as group 3, the rewrite working from the whole match.
+The closing lookahead is checked by
+`markdown-reflow--dot-opens-appellation-p'.  The identifier is
+possessive in the specification, and an Emacs regexp needs no such
+care: the lookahead is checked after matching, and a rejected match
+is never retried shorter.")
+
+(defconst markdown-reflow--path-reference-re
+  (concat "§\\([A-Za-z0-9_/#.-]+\\):\\([A-Za-z0-9_/#-]+\\)"
+          markdown-reflow--appellations-re)
+  "Reference to a section by its anchor in another document.
+Group 1 is the path and group 2 the anchor identifier.  The path
+class holds no colon, so group 1 is always the whole run from the
+section mark to the first colon.  That it hold a dot, open with no
+slash, and close with no dot, which the specified lookarounds
+assert, is checked by `markdown-reflow--path-p'.  Where any of
+those or the closing lookahead fails, the match is retried as
+`markdown-reflow--reference-re', as the specified optional group
+would be.")
 
 (defconst markdown-reflow--identifier-char-re
   "\\`[A-Za-z0-9_/#-]\\'"
@@ -194,6 +221,16 @@ Fixed by GFM at four columns, independent of `tab-width'.")
 
 (defvar markdown-reflow--problems nil
   "Errors and warnings logged by the reflow in progress, most recent first.")
+
+(defvar markdown-reflow--origin nil
+  "File name of the document being reflowed, nil where it has none.
+Paths of references are resolved against its directory.")
+
+(defvar markdown-reflow--targets nil
+  "Anchor tables of the documents the reflow in progress has read.
+A hash table from true file name to anchor table, or to nil for a
+document that cannot be read, so that each is read once and every
+reference to it resolves against the same text.")
 
 (defun markdown-reflow--change (line format &rest args)
   "Log a change at LINE described by FORMAT and ARGS."
@@ -519,7 +556,7 @@ the section number of the heading carrying it, nil if unnumbered."
                 (puthash id (cons 1 number) anchors)))))))
     (list numbers anchored anchors)))
 
-(defun markdown-reflow--resolve (id anchors line)
+(defun markdown-reflow--resolve (id anchors line &optional path)
   "Return the appellation for a reference to ID in ANCHORS.
 The value is nil where the section bears no number, there being
 nothing to expand the reference with; the caller then emits the
@@ -527,11 +564,13 @@ bare reference.  Only an anchor that does not exist is logged,
 against LINE, there being no heading to log it against.  A
 duplicated anchor is a property of the heading lines and was
 logged against each redefinition by `markdown-reflow--analyze',
-whatever the references it spoils."
+whatever the references it spoils, or is the concern of the
+target at PATH, which logs it when it is itself reflowed."
   (let ((entry (gethash id anchors)))
     (cond
      ((null entry)
-      (markdown-reflow--problem (1+ line) "reference to undefined anchor: §%s" id)
+      (markdown-reflow--problem (1+ line) "reference to undefined anchor: §%s%s"
+                                (if path (concat path ":") "") id)
       "NOREF")
      ;; A duplicated anchor is flagged whether or not it is numbered.
      ((> (car entry) 1)
@@ -543,6 +582,51 @@ whatever the references it spoils."
      ;; A reference carries no trailing dot, being agnostic to the one
      ;; a single-component heading number bears.
      (t (string-remove-suffix "." (cdr entry))))))
+
+
+;;; Targets
+
+(defun markdown-reflow--path-p (path)
+  "Return non-nil if PATH, a run of path characters, is a path.
+A path holds a dot, which tells it from an anchor identifier, opens
+with no slash, being always relative, and closes with no dot, so
+that a reference closing a sentence ahead of a colon reads as it
+did before paths were recognized."
+  (and (string-match-p "\\." path)
+       (not (string-prefix-p "/" path))
+       (not (string-suffix-p "." path))))
+
+(defun markdown-reflow--read-target (file)
+  "Return the anchor table of FILE, nil if it cannot be read.
+FILE is studied as reflow would number it, so the numbers written in
+it are not consulted.  Defects within it are its own, logged when it
+is itself reflowed, so whatever its analysis logs is discarded."
+  (when (and (file-regular-p file) (file-readable-p file))
+    (condition-case nil
+        (with-temp-buffer
+          (let ((coding-system-for-read 'utf-8))
+            (insert-file-contents file))
+          (let* ((markdown-reflow--problems nil)
+                 (case-fold-search nil)
+                 (lines (markdown-reflow--buffer-lines)))
+            (nth 2 (markdown-reflow--analyze
+                    lines (markdown-reflow--mask lines)))))
+      (file-error nil))))
+
+(defun markdown-reflow--target-anchors (path)
+  "Return the anchor table of the document at PATH, nil if unreadable.
+PATH is resolved against the directory of `markdown-reflow--origin'
+and each document read once per reflow.  The document being reflowed
+is entered beforehand, so a path naming it yields its anchors as this
+reflow numbers them, not as last saved."
+  (let* ((file (file-truename
+                (expand-file-name path (file-name-directory
+                                        markdown-reflow--origin))))
+         (table (gethash file markdown-reflow--targets 'unread)))
+    (if (eq table 'unread)
+        (puthash file (markdown-reflow--read-target file)
+                 markdown-reflow--targets)
+      table)))
 
 
 ;;; Rewriting
@@ -563,6 +647,53 @@ follow it."
        (string-match-p markdown-reflow--identifier-char-re
                        (string (aref line (1+ end))))))
 
+(defun markdown-reflow--next-reference (line pos)
+  "Return the next match of a reference in LINE at or after POS, or nil.
+The value is a list (BEGIN END PATH ID): the extent of the match,
+its path, nil where it bears none, and its anchor identifier, nil
+where the match is no reference and is to be left whole.  A path
+form failing its constraints or the closing lookahead is retried
+without the path, as the specified optional group would be, and a
+section mark opening no reference at all is matched alone."
+  (let ((begin (string-match "§" line pos)))
+    (when begin
+      (or (and (eql (string-match markdown-reflow--path-reference-re line begin)
+                    begin)
+               (markdown-reflow--path-p (match-string 1 line))
+               (not (markdown-reflow--dot-opens-appellation-p line (match-end 0)))
+               (list begin (match-end 0) (match-string 1 line) (match-string 2 line)))
+          (and (eql (string-match markdown-reflow--reference-re line begin) begin)
+               (list begin (match-end 0) nil
+                     (unless (markdown-reflow--dot-opens-appellation-p
+                              line (match-end 0))
+                       (match-string 1 line))))
+          (list begin (1+ begin) nil nil)))))
+
+(defun markdown-reflow--reference (path id anchors line old)
+  "Return the text of the reference to ID, bearing PATH, at LINE.
+ANCHORS is the table of the document being reflowed, consulted
+where PATH is nil.  Where PATH names a document that cannot be read,
+or the document being reflowed has no location to resolve it
+against, the error is logged and OLD, the reference as it stands,
+returned whole, leaving its last resolution in place."
+  (let ((table (cond ((null path) anchors)
+                     (markdown-reflow--origin
+                      (markdown-reflow--target-anchors path)))))
+    (cond
+     (table
+      (let ((appellation (markdown-reflow--resolve id table line path)))
+        (concat "§" (if path (concat path ":") "") id
+                (if appellation (concat ":" appellation) ""))))
+     (markdown-reflow--origin
+      (markdown-reflow--problem (1+ line) "reference to unreadable document: §%s:%s"
+                                path id)
+      old)
+     (t
+      (markdown-reflow--problem
+       (1+ line) "reference to another document from one with no file: §%s:%s"
+       path id)
+      old))))
+
 (defun markdown-reflow--update-references (line index marks anchors counts)
   "Return LINE with its unmasked references updated.
 INDEX is the line's position, MARKS the mask, ANCHORS the table
@@ -572,20 +703,18 @@ has no appellation to take and is emitted bare.  A masked match
 and one the closing lookahead rejects are alike left whole, and
 neither is resolved, so neither draws a log."
   (let ((result "")
-        (pos 0))
-    (while (string-match markdown-reflow--reference-re line pos)
-      (let* ((begin (match-beginning 0))
-             (end (match-end 0))
-             (id (match-string 1 line))
+        (pos 0)
+        (match nil))
+    (while (setq match (markdown-reflow--next-reference line pos))
+      (let* ((begin (nth 0 match))
+             (end (nth 1 match))
+             (id (nth 3 match))
              (old (substring line begin end))
-             (new (if (or (markdown-reflow--masked-p marks index begin)
-                          (markdown-reflow--dot-opens-appellation-p line end))
+             (new (if (or (null id)
+                          (markdown-reflow--masked-p marks index begin))
                       old
-                    (let ((appellation
-                           (markdown-reflow--resolve id anchors index)))
-                      (if appellation
-                          (concat "§" id ":" appellation)
-                        (concat "§" id))))))
+                    (markdown-reflow--reference (nth 2 match) id anchors
+                                                index old))))
         (unless (string= new old)
           (aset counts 1 (1+ (aref counts 1))))
         (setq result (concat result (substring line pos begin) new)
@@ -727,8 +856,9 @@ default of 70 stands in for that."
 
 Section numbers are renumbered so that the numbering at each
 depth starts at 1, has no gaps, and is in order; references are
-given the number of the section whose anchor they name; and
-anchors are right-justified to `markdown-reflow-width', which
+given the number of the section whose anchor they name, in this
+document or in another named by a path relative to this one's file;
+and anchors are right-justified to `markdown-reflow-width', which
 defaults to `fill-column'.  Code blocks and inline code are left
 alone.
 
@@ -739,6 +869,8 @@ and point is left where it was.  Changes are logged to the
   (barf-if-buffer-read-only)
   (let ((markdown-reflow--changes nil)
         (markdown-reflow--problems nil)
+        (markdown-reflow--origin buffer-file-name)
+        (markdown-reflow--targets (make-hash-table :test #'equal))
         (case-fold-search nil)
         (counts (make-vector 3 0)))
     (save-excursion
@@ -746,12 +878,18 @@ and point is left where it was.  Changes are logged to the
         (widen)
         (let* ((lines (markdown-reflow--buffer-lines))
                (marks (markdown-reflow--mask lines))
-               (analysis (markdown-reflow--analyze lines marks))
-               (rewritten (markdown-reflow--rewrite
-                           lines marks
-                           (nth 0 analysis) (nth 1 analysis) (nth 2 analysis)
-                           (markdown-reflow--width) counts)))
-          (markdown-reflow--apply lines rewritten))))
+               (analysis (markdown-reflow--analyze lines marks)))
+          ;; A path naming this document resolves against it as reflowed
+          ;; here, not as last saved.
+          (when markdown-reflow--origin
+            (puthash (file-truename markdown-reflow--origin) (nth 2 analysis)
+                     markdown-reflow--targets))
+          (markdown-reflow--apply
+           lines
+           (markdown-reflow--rewrite
+            lines marks
+            (nth 0 analysis) (nth 1 analysis) (nth 2 analysis)
+            (markdown-reflow--width) counts)))))
     (markdown-reflow--report counts)))
 
 (provide 'markdown-reflow)
